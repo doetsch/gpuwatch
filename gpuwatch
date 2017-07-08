@@ -1,0 +1,324 @@
+#! /usr/bin/env python
+
+import os
+import pynvml
+import time
+import threading
+import numpy
+import Tkinter as tk
+import ttk
+import matplotlib
+import matplotlib.patches as mpatches
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from subprocess import call
+from thread import start_new_thread
+
+class DeviceInfo:
+  def __init__(self, device_id):
+    self.raw_id = device_id
+    devmap = [0, 1] # [2, 3, 1, 0]
+    self.nvml_id = devmap[device_id]
+    self.maphandle = pynvml.nvmlDeviceGetHandleByIndex(devmap[device_id])
+    devmap = [0, 1] #[3, 2, 0, 1]
+    self.dev_id = devmap[device_id]
+    self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+
+  def memory_used(self):
+    return pynvml.nvmlDeviceGetMemoryInfo(self.handle).used
+
+  def memory_total(self):
+    return pynvml.nvmlDeviceGetMemoryInfo(self.handle).total
+
+  def fan_speed(self):
+    return pynvml.nvmlDeviceGetFanSpeed(self.maphandle)
+
+  def temperature(self):
+    return pynvml.nvmlDeviceGetTemperature(self.handle, pynvml.NVML_TEMPERATURE_GPU)
+
+  def name(self):
+    return pynvml.nvmlDeviceGetName(self.handle)
+
+  def mode(self, procs):
+    for proc in procs:
+      if 'rnn.py' in proc:
+        active = False
+        name = 'N/A'
+        try:
+          for line in open(proc[proc.find('/tmp'):].split('-')[0], 'r').readlines():
+            line = line.strip().split()
+            if len(line) == 0: continue
+            if line[0] == 'log':
+              name = line[1].split('/')[-1][:-4]
+            if line[0] == 'device':
+              if 'gpu' + repr(self.dev_id) in [ g.split(':')[0].replace('_','') for g in line[1].split(',') ]:
+                active = True
+        except: pass
+        if active:
+          return ('rnn', name)
+      if 'ethminer' in proc or 'ethdminer' in proc:
+        try:
+          if int(proc[-1]) == self.dev_id:
+            return ('mining', )
+        except: pass
+    return ('idle',)
+
+class DeviceView:
+  def __init__(self, root, dev, sizes):
+    self.dev = dev
+    self.root = root
+    self.sizes = sizes
+    tk.Label(root, width = sizes[0], text="%d"%dev.dev_id, font = "monospace 15",
+             relief=tk.RIDGE, bg = "white").grid(row = dev.dev_id + 1, column = 0)
+    tk.Label(root, width = sizes[1], text=" " + dev.name(), font = "monospace 15",
+             relief=tk.RIDGE, bg = "white", anchor = tk.W).grid(row = dev.dev_id + 1, column = 1)
+
+    self.vars = {}
+    self.labs = {}
+    self.stats = {}
+    self.max = {}
+
+    self.make_field(root, 2, "memory")
+    self.make_field(root, 3, "temperature")
+    self.vars["fan"] = tk.IntVar()
+    self.labs["fan"] = ttk.Progressbar(root, length = sizes[4] * 10, variable = self.vars["fan"])
+    self.labs["fan"].grid(row = self.dev.raw_id + 1, column = 4)
+    self.stats["fan"] = []
+    self.make_field(root, 5, "mode")
+    self.make_field(root, 6, "aux")
+
+  def toggle_maximum_signal(self, var, event):
+    if self.max[var]:
+      self.max[var] = None
+    else:
+      self.max[var] = len(self.stats[var]) - 1
+
+  def make_field(self, root, col, var):
+    self.max[var] = None
+    self.vars[var] = tk.StringVar()
+    self.labs[var] = tk.Label(root, width = self.sizes[col], textvariable = self.vars[var],
+                              font = "monospace 15", relief=tk.RIDGE, bg = "white")
+    self.labs[var].bind("<Button-1>", lambda e: self.toggle_maximum_signal(var, e))
+    self.labs[var].grid(row = self.dev.dev_id + 1, column = col)
+    self.stats[var] = []
+
+  def highlight(self, var):
+    if self.max[var]:
+      self.labs[var].config(font = "monospace 15 bold")
+    else:
+      self.labs[var].config(font = "monospace 15")
+    self.root.update()
+
+  def update_memory(self):
+    used = self.dev.memory_used()
+    self.stats["memory"].append(used)
+    if self.max["memory"]:
+      used = max(self.stats["memory"][self.max["memory"]:])
+    mbytes = str(used / (1024*1024))
+    padded = ' ' * (4 - len(mbytes)) + mbytes
+    self.vars["memory"].set("%s MB"%mbytes)
+    self.highlight("memory")
+
+  def update_temp(self):
+    temp = self.dev.temperature()
+    self.stats["temperature"].append(temp)
+    if self.max["temperature"]:
+      temp = max(self.stats["temperature"][self.max["temperature"]:])
+    bg = "#9df338"
+    if temp >= 60:
+      bg = "#d7f338"
+    if temp >= 70:
+      bg = "#f1eb2f"
+    if temp >= 75:
+      bg = "#f1922d"
+    if temp >= 80:
+      bg = "#d51919"
+    self.labs["temperature"].config(bg = bg)
+    self.vars["temperature"].set("%d C"%temp)
+    self.highlight("temperature")
+
+  def update_fan(self):
+    fan_speed = self.dev.fan_speed()
+    self.vars["fan"].set(fan_speed)
+    self.stats["fan"].append(fan_speed)
+
+  def update_mode(self, procs):
+    mode = self.dev.mode(procs)
+    self.vars["mode"].set(mode[0])
+    self.stats["mode"].append(mode[0])
+    aux = '--'
+    #if mode[0] == 'mining':
+    #  aux = "%d khash/s" % int(mode[1])
+    if mode[0] == 'rnn':
+      aux = mode[1]
+    self.vars["aux"].set(aux)
+
+class GraphFrame:
+  def __init__(self, root, width):
+    self.visible = False
+    self.frame = tk.Frame(root, background = "white", borderwidth = 2)
+    ppi = root.winfo_fpixels( '1i' )
+    self.figure = Figure(figsize=(width * 12 / ppi, 3), dpi = ppi)
+    self.figure.subplots_adjust(left=0.06, right=0.98, top=0.9, bottom=0.1)
+    self.figure.patch.set_facecolor('white')
+    self.interval = [0, 0]
+    self.subplot = self.figure.add_subplot(111, axisbg='white')
+    self.last_update = 0
+    self.canvas = FigureCanvasTkAgg(self.figure, master=self.frame)
+    self.canvas.show()
+    self.canvas.get_tk_widget().grid(row = 0, column = 0, columnspan = 7)
+
+  def plot(self, x, y, params = {}):
+    self.subplot.plot(x, y, **params)
+
+  def draw(self):
+    self.canvas.draw()
+
+  def show(self, row):
+    self.frame.grid(row = row, column = 0, columnspan = 7)
+    self.visible = True
+
+  def hide(self):
+    self.frame.grid_forget()
+    self.visible = False
+
+  def clear(self):
+    self.subplot.cla()
+    self.subplot.legend(self.handles, self.labels, ncol = len(self.labels), loc='upper center',
+                                      prop={'family': 'monospace', 'size' : 10, 'weight' : 'bold'})
+    self.figure.subplots_adjust(left=0.06, right=0.98, top=0.9, bottom=0.1)
+    self.subplot.set_ylim((0, self.ylim + self.ylim / 5))
+
+class GUI:
+  def __init__(self, root):
+    devices = [ DeviceInfo(i) for i in xrange(pynvml.nvmlDeviceGetCount()) ]
+    self.sizes = [ 2, max(11, max([ len(dev.name()) for dev in devices ]) + 2), 8, 13, 12, 8, 15 ]
+    self.width = sum(self.sizes)
+    self.views = sorted([ DeviceView(root, dev, self.sizes) for dev in devices ], key = lambda v: v.dev.dev_id)
+    self.root = root
+    self.time = 0
+    self.time_interval = 1000
+    params = { "relief" : tk.GROOVE, "bg" : "white", "font": "monospace 15 bold" }
+    self.global_params = params
+    self.minerswitch = tk.Button(root, width = self.sizes[0] * 10, height = self.sizes[0] * 10, bitmap = "gray25" , command = self.options, compound=tk.LEFT, **params)
+    self.minerswitch.grid(row = 0, column = 0)
+    tk.Label(root, width = self.sizes[1], text="device name", **params).grid(row = 0, column = 1)
+    tk.Label(root, width = self.sizes[6], text="info", **params).grid(row = 0, column = 6)
+
+    self.frames = {}
+    self.graphcolor = [ '#ff0000', '#00ff00', '#0000ff', '#ccbb00' ]
+    self.make_details("memory", 2, ylim = max([dev.memory_total()/(1024*1024) for dev in devices]))
+    self.make_details("temperature", 3, ylim = 100)
+    self.make_details("fan", 4, ylim = 100)
+    self.make_details("mode", 5, ylim = 2)
+    self.mine = False
+
+  def make_details(self, signal, col, ylim = None):
+    tk.Checkbutton(self.root, command = lambda : self.details(signal),
+                   width = self.sizes[col], text = signal,
+                   indicatoron = False, **self.global_params).grid(row = 0, column = col)
+    self.frames[signal] = GraphFrame(self.root, self.width)
+    self.frames[signal].handles = [ mpatches.Patch(color=self.graphcolor[view.dev.raw_id],
+                               label="(%d) %s"%(view.dev.dev_id,view.dev.name())) for view in self.views ]
+    self.frames[signal].labels = [ "(%d) %s"%(view.dev.dev_id,view.dev.name()) for view in self.views ]
+    self.frames[signal].subplot.legend(self.frames[signal].handles, self.frames[signal].labels, ncol = len(self.frames[signal].labels), loc='upper center',
+                                       prop={'family': 'monospace', 'size' : 10, 'weight' : 'bold'})
+    self.frames[signal].ylim = None
+    if ylim:
+      self.frames[signal].ylim = ylim
+      self.frames[signal].subplot.set_ylim((0, ylim + ylim / 5))
+      if ylim < 10:
+        yticks = numpy.arange(0, ylim, 1)
+      else:
+        ystep = ylim / 5
+        yticks = numpy.arange(0, (ystep + (ylim % 5 == 0)) * 5, ystep)
+      self.frames[signal].subplot.set_yticks(yticks)
+    self.frames[signal].subplot.set_title(signal)
+
+  def details(self, signal):
+    if self.frames[signal].visible:
+      self.frames[signal].hide()
+    else:
+      self.frames[signal].visible = True
+
+    num_visible_frames = 0
+    for frame in self.frames.values():
+      if frame.visible:
+        frame.show(7 + num_visible_frames)
+        num_visible_frames += 1
+
+  def options(self):
+    if self.mine:
+      call("killall -s SIGKILL automine ethminer ethdminer".split())
+    else:
+      start_new_thread(call, (["automine"],))
+    self.mine = not self.mine
+    if self.mine:
+      self.minerswitch.configure(bitmap="gray75")
+    else:
+      self.minerswitch.configure(bitmap="gray25")
+    #self.minerswitch.pack()
+
+  def update_graph(self, signal, tap, proc = None):
+    if not self.frames[signal].visible: return
+    seconds = self.time * self.time_interval / 1000
+    if seconds == tap or seconds % tap != 0: return
+    seconds /= tap
+    if proc == None: proc = lambda x: x
+    if self.frames[signal].interval[1] - self.frames[signal].interval[0] > 500:
+      self.frames[signal].interval[0] = self.frames[signal].interval[1] - 250
+      self.frames[signal].last_update -= 250
+      self.frames[signal].clear()
+
+    last = self.frames[signal].last_update
+    t = numpy.arange(last, seconds + 1) * tap
+    self.frames[signal].interval[1] += t.shape[0]
+    for view in self.views:
+      y = proc(numpy.asarray(view.stats[signal][last:seconds + 1]))
+      self.frames[signal].plot(t, y, { 'color' : self.graphcolor[view.dev.raw_id] })
+    self.frames[signal].draw()
+    self.frames[signal].last_update += t.shape[0] - 1
+
+  def update_data(self):
+    seconds = self.time * self.time_interval / 1000
+    for view in self.views:
+      view.update_memory()
+      if self.time % 2 == 0:
+        view.update_temp()
+      if self.time % 5 == 0:
+        view.update_fan()
+    if self.time % 10 == 0:
+      pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+      procs = []
+      for pid in pids:
+        try:
+          procs.append(open(os.path.join('/proc', pid, 'cmdline'), 'rb').read().replace('\0', ''))
+        except IOError: # proc has already terminated
+          continue
+      for view in self.views:
+        view.update_mode(procs)
+
+    self.update_graph("memory", 1, proc = lambda x: x / (1024*1024))
+    self.update_graph("temperature", 2)
+    self.update_graph("fan", 5)
+    #self.update_graph("mode", 10, proc = lambda x: 1 if x == 'mining' else 0)
+
+    self.time += 1
+    self.root.after(self.time_interval, self.update_data)
+
+
+pynvml.nvmlInit()
+root = tk.Tk()
+root.title("GPU watch")
+root.configure(bg = 'white')
+root.resizable(width=tk.FALSE, height=tk.FALSE)
+def key(event):
+  if event.keycode == 9:
+    root.destroy()
+root.bind("<Key>", key)
+gui = GUI(root)
+gui.update_data()
+
+root.mainloop()
+if gui.mine:
+    call("killall -s SIGTERM automine ethminer ethdminer".split())
